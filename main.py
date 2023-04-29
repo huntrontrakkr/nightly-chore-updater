@@ -2,7 +2,9 @@ import os
 import logging
 import logging.handlers
 from datetime import date, timedelta
-from notion_client import Client
+from pprint import pprint
+
+from notion_client import Client, APIResponseError
 from twilio.rest import Client as TwilioClient
 from dotenv import load_dotenv
 
@@ -18,7 +20,7 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 # Initialize Notion client with API key
-notion = Client(auth=os.environ["NOTION_API_KEY"])
+notion = Client(auth=os.environ["NOTION_API_KEY"], log_level=logging.DEBUG)
 
 # Initialize Twilio client
 twilio_account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
@@ -38,38 +40,63 @@ def get_database_id(database_url):
 
 
 def update_page(page_id, new_status, last_completed):
-    notion.pages.update_properties(
+    notion.pages.update(
         page_id,
         properties={
-            "Status": {"select": {"name": new_status}},
+            "Status": {"status": {"name": new_status}},
             "Last Completed": {"date": {"start": last_completed.isoformat()}},
         },
     )
+
+
+def find_title_property(properties):
+    for key, prop in properties.items():
+        if prop['type'] == 'title':
+            return key, prop
+    return None, None
 
 
 def process_pages(database_id):
     today = date.today()
     yesterday = today - timedelta(days=1)
 
-    pages = notion.databases.query(
-        **{
-            "database_id": database_id,
-            "filter": {"property": "Status", "select": {"equals": "Done"}},
-        }
-    ).get("results")
+    try:
+        pages = notion.databases.query(
+            database_id,
+            filter={"property": "Status", "status": {"equals": "Done"}},
+        ).get("results")
+    except APIResponseError as error:
+        logger.error(f"Error querying pages: {error}")
+        return []
 
     changed_fields = []
 
     for page in pages:
-        due_next = page["properties"]["Due Next"]["date"]["start"]
-        due_next = date.fromisoformat(due_next)
+        try:
+            status = page["properties"]["Status"]["status"]["name"]
+            due_next = page["properties"]["Due Next"]["formula"]["date"]["start"]
+            due_next = date.fromisoformat(due_next)
+        except KeyError as e:
+            logger.error(f"Error processing page {page['id']}: missing property {e}")
+            continue
 
-        if due_next <= yesterday:
-            logger.info(f"Processing page '{page['title']['plain_text']}' (ID: {page['id']})")
-            update_page(page["id"], "Not Started", today)
-            changed_fields.append({"page_id": page["id"], "title": page["title"]["plain_text"]})
-            logger.info(
-                f"Updated Status to 'Not Started' and set Last Completed to {today} for page '{page['title']['plain_text']}' (ID: {page['id']})")
+        # Find the 'title' property by its 'id'
+        title_property_id = None
+        for prop_id, prop in page["properties"].items():
+            if prop["type"] == "title":
+                title_property_id = prop_id
+                break
+
+        if not title_property_id:
+            logger.error(f"Error processing page {page['id']}: 'title' property not found")
+            continue
+
+        if status == "Done" and due_next <= yesterday:
+            page_title = page["properties"][title_property_id]["title"][0]["plain_text"]
+            logger.info(f"Processing page '{page_title}' (ID: {page['id']})")
+            update_page(page["id"], "Not started", today)
+            changed_fields.append({"page_id": page["id"], "title": page_title})
+            logger.info(f"Processing page (ID: {page['id']})")
 
     return changed_fields
 
